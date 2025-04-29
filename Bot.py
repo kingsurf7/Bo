@@ -1,14 +1,18 @@
 import logging
-import requests
-import whisper
-from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command
-from aiogram.types import Message
-from ultralytics import YOLO
+import os
 import asyncio
 import tempfile
-import os
-import random
+from datetime import datetime, timedelta
+from typing import Any, Callable, Awaitable, Tuple
+
+import requests
+import whisper
+from aiogram import Bot, Dispatcher, types, F, BaseMiddleware
+from aiogram.filters import Command
+from aiogram.types import Message
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from ultralytics import YOLO
 
 # Configuration du logging
 logging.basicConfig(
@@ -17,204 +21,255 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Token Telegram - À remplacer par votre vrai token
-TOKEN = "TON_TOKEN_TELEGRAM"
-
-# Vérification du token
-if not TOKEN or TOKEN == "7635358951:AAE_yNMXcLiIKyJIbf-My3v4-PHs3pcUheI":
-    raise ValueError("Oups ! Il semble que le token du bot n'est pas configuré. 😅")
+# Configuration du token
+TOKEN = os.getenv("TELEGRAM_TOKEN", "TON_TOKEN_TELEGRAM")
+if not TOKEN or TOKEN == "TON_TOKEN_TELEGRAM":
+    raise ValueError("Token Telegram manquant ou invalide")
 
 # Initialisation du bot
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-# Liste des chaînes à vérifier
+# Liste des canaux requis
 CHANNELS = [
-    "@Brainless_dev", 
-    "@LaboratoireDuFreeSurf", 
-    "@hat_tunnel", 
+    "@UniversDuFreeSurf",
+    "@LaboratoireDuFreeSurf",
+    "@hat_tunnel",
     "@premium_apk_made_for_you"
 ]
 
-# Messages plus naturels
-GREETINGS = [
-    "Salut ! Comment puis-je t'aider aujourd'hui ? 😊",
-    "Bonjour ! Prêt à explorer ensemble ? 🌟",
-    "Coucou ! Qu'est-ce qui te amène ici aujourd'hui ? 🤗"
-]
-
-ERROR_MESSAGES = {
-    "api": "Oh non ! J'ai du mal à me connecter à mon cerveau numérique... Peux-tu réessayer ? 🤔",
-    "generic": "Oups ! Quelque chose s'est mal passé de mon côté. Je vais me secouer les circuits et tu peux réessayer ! 😅",
-    "subscription": "Je vois que tu n'es pas encore abonné à tous nos canaux. Rejoins-nous pour débloquer toutes les fonctionnalités ! 🚀"
-}
-
-# Chargement des modèles (une seule fois au démarrage)
+# Chargement des modèles
 try:
     vision_model = YOLO("yolov8n.pt")
     speech_model = whisper.load_model("base")
     logger.info("Modèles chargés avec succès")
 except Exception as e:
-    logger.error(f"Erreur lors du chargement des modèles : {e}")
+    logger.error(f"Erreur lors du chargement des modèles: {e}")
     raise
 
-async def is_user_subscribed(user_id: int) -> bool:
-    """Vérifie si l'utilisateur est abonné à tous les canaux requis."""
+# Gestion des états
+class UserState(StatesGroup):
+    awaiting_response = State()
+
+# Système de rate limiting
+class RateLimiter:
+    def __init__(self):
+        self.user_last_request = {}
+        self.cooldown = 5  # secondes entre requêtes
+
+    async def check_rate_limit(self, user_id: int) -> Tuple[bool, float]:
+        now = datetime.now()
+        last_request = self.user_last_request.get(user_id)
+
+        if last_request and (now - last_request) < timedelta(seconds=self.cooldown):
+            remaining = (last_request + timedelta(seconds=self.cooldown) - now
+            return False, remaining.total_seconds()
+
+        self.user_last_request[user_id] = now
+        return True, 0
+
+rate_limiter = RateLimiter()
+
+# Middleware anti-spam
+class RateLimitMiddleware(BaseMiddleware):
+    async def __call__(
+        self,
+        handler: Callable[[Message, dict], Awaitable[Any]],
+        event: Message,
+        data: dict
+    ) -> Any:
+        user = data.get("event_from_user")
+        if user:
+            allowed, remaining = await rate_limiter.check_rate_limit(user.id)
+            if not allowed:
+                await event.answer(
+                    f"⌛ Attendez {int(remaining)}s avant une nouvelle requête",
+                    show_alert=True
+                )
+                return
+        return await handler(event, data)
+
+dp.message.middleware(RateLimitMiddleware())
+
+async def is_user_subscribed(user_id: int) -> Tuple[bool, str]:
+    """Vérifie les abonnements aux chaînes"""
+    missing = []
     for channel in CHANNELS:
         try:
             chat_member = await bot.get_chat_member(channel, user_id)
             if chat_member.status not in ["member", "administrator", "creator"]:
-                return False
+                missing.append(channel)
         except Exception as e:
-            logger.error(f"Erreur lors de la vérification de l'abonnement : {e}")
-            return False
-    return True
+            logger.error(f"Erreur vérification {channel}: {e}")
+            missing.append(channel)
+    
+    if missing:
+        message = "Abonnez-vous à:\n" + "\n".join(f"- {ch}" for ch in missing)
+        return False, message
+    return True, ""
 
 @dp.message(Command("start"))
 async def start(message: types.Message):
-    """Gère la commande /start."""
+    """Commande start"""
     user_id = message.from_user.id
-    first_name = message.from_user.first_name
     try:
-        if not await is_user_subscribed(user_id):
-            channels_list = "\n".join(f"👉 {channel}" for channel in CHANNELS)
-            await message.reply(
-                f"👋 Salut {first_name} ! Pour utiliser toutes les fonctionnalités de ce bot, "
-                f"tu dois être abonné à nos chaînes :\n\n{channels_list}\n\n"
-                "Une fois abonné, envoie-moi à nouveau /start et on pourra commencer l'aventure ! 💫"
-            )
-        else:
-            greeting = random.choice(GREETINGS)
-            await message.reply(
-                f"{greeting}\n\nJe suis BRAINLESS, ton compagnon numérique. Voici ce que je peux faire :\n\n"
-                "📝 Envoie-moi du texte pour discuter\n"
-                "📸 Envoie une photo pour que je l'analyse\n"
-                "🎤 Envoie un message vocal que je transcrirai\n\n"
-                "Alors, on commence par quoi ? 😉"
-            )
-    except Exception as e:
-        logger.error(f"Erreur dans /start : {e}")
-        await message.reply("Oups ! J'ai eu un petit bug... Peux-tu réessayer ? 🐞")
-
-@dp.message()
-async def handle_text(message: Message):
-    """Gère les messages textuels."""
-    try:
-        prompt = message.text.strip()
-        if not prompt:
-            await message.reply("Hmm... Je n'ai rien reçu. Peux-tu répéter ? 🧐")
+        subscribed, msg = await is_user_subscribed(user_id)
+        if not subscribed:
+            await message.reply(f"{msg}\n\nPuis relancez /start")
             return
 
-        # Simulation de "réflexion"
-        await message.reply_chat_action("typing")
+        await message.reply(
+            "🤖 Bienvenue!\n"
+            "Envoyez:\n"
+            "- Texte pour réponse\n"
+            "- Photo pour analyse\n"
+            "- Vocal pour transcription"
+        )
+    except Exception as e:
+        logger.error(f"Erreur /start: {e}")
+        await message.reply("❌ Erreur, réessayez")
+
+@dp.message(Command("help"))
+async def help_cmd(message: types.Message):
+    """Commande help"""
+    help_text = (
+        "🛠️ Aide:\n"
+        "/start - Démarrer le bot\n"
+        "/help - Afficher ce message\n\n"
+        "Fonctions:\n"
+        "- Réponse aux questions\n"
+        "- Analyse d'images\n"
+        "- Transcription vocale"
+    )
+    await message.reply(help_text)
+
+@dp.message(F.text)
+async def handle_text(message: Message, state: FSMContext):
+    """Gestion des messages texte"""
+    try:
+        # Vérification rate limit
+        allowed, remaining = await rate_limiter.check_rate_limit(message.from_user.id)
+        if not allowed:
+            await message.reply(f"⏳ Attendez {int(remaining)}s")
+            return
+
+        await state.set_state(UserState.awaiting_response.state)
+        await bot.send_chat_action(message.chat.id, "typing")
+
+        # Traitement du texte
+        prompt = message.text.strip()
+        if not prompt:
+            await message.reply("ℹ️ Message vide")
+            return
+
+        # Simulation traitement
         await asyncio.sleep(1)
-        
-        encoded_prompt = requests.utils.quote(prompt)
-        api_url = f"https://bk9.fun/ai/blackbox?q={encoded_prompt}"
-        
-        response = requests.get(api_url, timeout=10)
+
+        # Requête API
+        response = requests.get(
+            f"https://bk9.fun/ai/blackbox?q={requests.utils.quote(prompt)}",
+            timeout=10
+        )
         response.raise_for_status()
         
         data = response.json()
-        if not data.get("BK9"):
-            await message.reply("Je suis désolé, je n'ai pas trouvé de réponse pertinente... Peux-tu reformuler ? 🤔")
-            return
-            
-        reply_text = data["BK9"]
-        
-        # Ajout d'une touche personnelle
-        reactions = ["Voici ce que j'en pense :", "J'ai creusé la question :", "Après réflexion :", "Voici ma réponse :"]
-        chosen_reaction = random.choice(reactions)
-        
-        await message.reply(
-            f"✨ *{chosen_reaction}*\n\n{reply_text}\n\n---\n_Tu veux explorer autre chose ?_ 😊", 
-            parse_mode="Markdown"
-        )
-    except requests.RequestException as e:
-        logger.error(f"Erreur API : {e}")
-        await message.reply(ERROR_MESSAGES["api"])
+        reply = data.get("BK9", "Pas de réponse disponible")
+        await message.reply(f"💡 Réponse:\n{reply}")
+
+    except requests.RequestException:
+        await message.reply("🌐 Erreur réseau")
     except Exception as e:
-        logger.error(f"Erreur dans handle_text : {e}")
-        await message.reply(ERROR_MESSAGES["generic"])
+        logger.error(f"Erreur texte: {e}")
+        await message.reply("❌ Erreur de traitement")
+    finally:
+        await state.clear()
 
 @dp.message(F.photo)
-async def handle_image(message: types.Message):
-    """Gère les images envoyées."""
+async def handle_image(message: types.Message, state: FSMContext):
+    """Gestion des images"""
     try:
-        # Message pendant le traitement
-        processing_msg = await message.reply("🔍 Je scrute ton image... Donne-moi une seconde !")
+        # Vérification rate limit
+        allowed, remaining = await rate_limiter.check_rate_limit(message.from_user.id)
+        if not allowed:
+            await message.reply(f"⏳ Attendez {int(remaining)}s")
+            return
+
+        await state.set_state(UserState.awaiting_response.state)
+        await bot.send_chat_action(message.chat.id, "upload_photo")
+
+        # Téléchargement photo
+        with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp_file:
+            file_path = tmp_file.name
+            await message.photo[-1].download(destination=file_path)
+
+        # Analyse image
+        results = vision_model(file_path)
+        detections = []
         
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as temp_file:
-            # Téléchargement de la photo
-            await message.photo[-1].download(destination_file=temp_file.name)
-            
-            # Analyse avec YOLO
-            results = vision_model(temp_file.name)
-            detections = results[0].boxes.data.tolist() if results else []
-            
-            if not detections:
-                await processing_msg.edit_text("Je n'ai rien détecté sur cette image... Es-tu sûr qu'elle n'est pas vide ? 😅")
-            else:
-                # Formatage plus naturel des résultats
-                objects = {}
-                for det in results[0].boxes.data:
-                    name = det['name']
-                    conf = det['confidence']*100
-                    if name in objects:
-                        objects[name] = max(objects[name], conf)
-                    else:
-                        objects[name] = conf
-                
-                # Tri par confiance
-                sorted_objects = sorted(objects.items(), key=lambda x: x[1], reverse=True)
-                
-                # Création du message
-                if len(sorted_objects) == 1:
-                    obj, conf = sorted_objects[0]
-                    response = f"Je vois un {obj} avec {conf:.1f}% de confiance ! 👀"
-                else:
-                    response = "Voici ce que j'ai repéré :\n"
-                    for obj, conf in sorted_objects:
-                        response += f"- {obj} ({conf:.1f}% de confiance)\n"
-                    response += "\nC'est bien ça ? 😊"
-                
-                await processing_msg.edit_text(response)
-                
+        for result in results:
+            for box in result.boxes:
+                detections.append({
+                    'name': result.names[int(box.cls)],
+                    'confidence': float(box.conf)
+                })
+
+        # Réponse
+        if not detections:
+            await message.reply("🔍 Aucun objet détecté")
+        else:
+            response = "🖼️ Objets détectés:\n" + "\n".join(
+                f"- {obj['name']} ({obj['confidence']*100:.1f}%)" 
+                for obj in detections
+            )
+            await message.reply(response)
+
     except Exception as e:
-        logger.error(f"Erreur dans handle_image : {e}")
-        await message.reply("Oh là là ! Mon analyse d'image a bugué... Peux-tu essayer avec une autre photo ? 📸")
+        logger.error(f"Erreur image: {e}")
+        await message.reply("❌ Erreur d'analyse")
     finally:
-        if 'temp_file' in locals() and os.path.exists(temp_file.name):
-            os.unlink(temp_file.name)
+        if 'file_path' in locals() and os.path.exists(file_path):
+            os.unlink(file_path)
+        await state.clear()
 
 @dp.message(F.voice)
-async def handle_voice(message: types.Message):
-    """Gère les messages vocaux."""
+async def handle_voice(message: types.Message, state: FSMContext):
+    """Gestion des messages vocaux"""
     try:
-        # Message pendant le traitement
-        processing_msg = await message.reply("🎧 J'écoute attentivement... Un instant !")
+        # Vérification rate limit
+        allowed, remaining = await rate_limiter.check_rate_limit(message.from_user.id)
+        if not allowed:
+            await message.reply(f"⏳ Attendez {int(remaining)}s")
+            return
+
+        await state.set_state(UserState.awaiting_response.state)
+        await bot.send_chat_action(message.chat.id, "typing")
+
+        # Téléchargement audio
+        with tempfile.NamedTemporaryFile(suffix='.ogg', delete=False) as tmp_file:
+            file_path = tmp_file.name
+            await message.voice.download(destination=file_path)
+
+        # Transcription
+        result = speech_model.transcribe(file_path)
+        text = result.get('text', '').strip()
         
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".ogg") as temp_file:
-            # Téléchargement du vocal
-            await message.voice.download(destination_file=temp_file.name)
-            
-            # Transcription
-            transcription = speech_model.transcribe(temp_file.name)
-            text = transcription.get('text', '').strip()
-            
-            if not text:
-                await processing_msg.edit_text("Je n'ai pas compris ton message vocal... Peux-tu le répéter plus clairement ? 🎤")
-            else:
-                # Réponse avec emoji aléatoire
-                emojis = ["📝", "✍️", "🗒️", "🎤"]
-                await processing_msg.edit_text(
-                    f"{random.choice(emojis)} Voici ce que j'ai entendu :\n\n"
-                    f"\"{text}\"\n\n"
-                    "C'est bien ça ? Sinon, n'hésite pas à me le ré-envoyer ! 😊"
-                )
-                
+        if text:
+            await message.reply(f"🎤 Transcription:\n{text}")
+        else:
+            await message.reply("🔇 Aucune transcription disponible")
+
     except Exception as e:
-        logger.error(f"Erreur dans handle_voice : {e}")
-        await message.reply("Oups ! Mon oreille numérique a des acouphènes... Peux-tu renvoyer ton message ? 🦻")
+        logger.error(f"Erreur vocal: {e}")
+        await message.reply("❌ Erreur de transcription")
     finally:
-        if 'temp_file' in
+        if 'file_path' in locals() and os.path.exists(file_path):
+            os.unlink(file_path)
+        await state.clear()
+
+if __name__ == "__main__":
+    from aiogram import executor
+    try:
+        logger.info("Démarrage du bot en mode polling...")
+        executor.start_polling(dp, skip_updates=True)
+    except Exception as e:
+        logger.error(f"Erreur fatale: {e}") 
